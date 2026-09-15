@@ -1028,6 +1028,7 @@ if(ANDROID)
     set(ANDROID_PLATFORM_SOURCES
         source/android/PdfPickerAndroid.cpp
         source/android/AndroidShareHelper.cpp
+        source/android/StylusButtonAndroid.cpp  # BUG-A010: pen barrel button
         source/ui/dialogs/SaveDocumentDialog.cpp  # BUG-A002: Touch-friendly save dialog
     )
 endif()

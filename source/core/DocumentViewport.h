@@ -611,6 +611,14 @@ public:
     ToolType currentTool() const { return m_currentTool; }
     
     /**
+     * @brief Whether a pointer (pen, mouse or finger) is currently pressed.
+     *
+     * Lets callers hold off a tool change that would otherwise land in the
+     * middle of a stroke or drag.
+     */
+    bool isPointerActive() const { return m_pointerActive; }
+    
+    /**
      * @brief Set the pen color for drawing.
      * @param color The color to use.
      */
@@ -4456,7 +4464,28 @@ private:
      * viewport being hidden.
      */
     void cancelOffPagePan();
-    
+
+    /**
+     * @brief Abandon the pointer gesture in flight, whichever tool owns it.
+     *
+     * A press that never gets its matching release leaves the gesture flags
+     * set, and because handlePointerMove() only asks whether a pointer is
+     * active, every later hover is then treated as a drag: the straight-line
+     * preview trails the hovering pen, the next release commits a line nobody
+     * drew, and the undo stack no longer matches the canvas.
+     *
+     * The two ways a release goes missing are a tool switch mid-press and
+     * Android cancelling the pen pointer when a finger joins, so this runs on
+     * both, and again on the next press as a backstop.
+     *
+     * Stroke points were really drawn, so a stroke is committed rather than
+     * dropped; preview-only gestures (straight line, lasso) are discarded
+     * because their end point never arrived.
+     *
+     * @return true if a gesture was in flight.
+     */
+    bool cancelPointerGesture();
+
     /**
      * @brief Load text boxes from PDF for the specified page.
      * @param pageIndex The page to load text boxes for.

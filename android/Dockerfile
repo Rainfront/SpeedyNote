@@ -59,7 +59,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # =============================================================================
 ENV ANDROID_SDK_ROOT=/opt/android-sdk
 ENV ANDROID_HOME=${ANDROID_SDK_ROOT}
-ENV JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64
+# Point at whichever OpenJDK the image actually installed (amd64 CI hosts vs
+# arm64 Apple Silicon Docker). The package lands in java-17-openjdk-<arch>.
+RUN ln -sfn "/usr/lib/jvm/java-17-openjdk-$(dpkg --print-architecture)" /opt/java-home
+ENV JAVA_HOME=/opt/java-home
 
 # Qt version to install
 # Qt 6.9.3 is the recommended version:
@@ -70,7 +73,8 @@ ENV QT_VERSION=6.9.3
 ENV QT_ROOT=/opt/qt
 ENV QT_ANDROID=${QT_ROOT}/${QT_VERSION}/android_arm64_v8a
 ENV QT_ANDROID_ARMV7=${QT_ROOT}/${QT_VERSION}/android_armv7
-# Note: aqtinstall uses "linux_gcc_64" as arch name but installs to "gcc_64"
+# Host tools path (linux_gcc_64 installs to gcc_64). Image must be amd64 —
+# see --platform=linux/amd64 in docker-build.sh.
 ENV QT_HOST=${QT_ROOT}/${QT_VERSION}/gcc_64
 
 # NDK version
@@ -124,8 +128,10 @@ RUN /opt/aqt-venv/bin/aqt install-qt linux android ${QT_VERSION} android_armv7 \
     -O ${QT_ROOT} \
     --modules qtimageformats
 
-# Install Qt host tools (needed for moc, uic, rcc, etc.)
-# Note: For Qt 6.x, architecture is "linux_gcc_64" not "gcc_64"
+# Install Qt host tools (needed for moc, uic, rcc, androiddeployqt, etc.)
+# Always linux_gcc_64: Qt 6.9.3 has no usable linux desktop arm64 host package,
+# and the Android NDK host tools are x86_64. Build/run this image with
+# --platform=linux/amd64 on Apple Silicon (see docker-build.sh / docker-shell.sh).
 RUN /opt/aqt-venv/bin/aqt install-qt linux desktop ${QT_VERSION} linux_gcc_64 \
     -O ${QT_ROOT} \
     --modules qtimageformats

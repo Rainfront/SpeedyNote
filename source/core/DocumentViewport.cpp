@@ -856,6 +856,12 @@ void DocumentViewport::setCurrentTool(ToolType tool)
         return;
     }
 
+    // A switch can land mid-press: the toolbar takes a finger tap while the
+    // pen is still down, or a pen side button toggles the eraser. The gesture
+    // that press started belongs to the outgoing tool and will never see its
+    // release, so it ends here rather than leaking into the new tool.
+    cancelPointerGesture();
+
     commitInlineTextEdit();
     // Adjust lives inside the Highlighter, so leaving that tool ends the
     // session. Commit rather than discard: every gesture in the session was
@@ -894,29 +900,9 @@ void DocumentViewport::setCurrentTool(ToolType tool)
         clearObjectSelection();
     }
     
-    // Cancel any in-progress eraser lasso when switching away from Eraser
-    if (previousTool == ToolType::Eraser && tool != ToolType::Eraser) {
-        if (m_isDrawingEraserLasso) {
-            m_isDrawingEraserLasso = false;
-            m_eraserLassoPageIndex = -1;
-            m_lassoPath.clear();
-            m_pointerActive = false;
-        }
-    }
-    
-    // Clean up Pan tool state when switching away
-    if (previousTool == ToolType::Pan && tool != ToolType::Pan) {
-        if (m_isPanToolDragging) {
-            endPanGesture();
-            m_isPanToolDragging = false;
-        }
-    }
-    
-    // An off-page pan belongs to no tool in particular, so it has to end
-    // whichever tool the user switches away from. The hover cursor is reset
-    // too, since updateHighlighterCursor() below replaces it with the new
-    // tool's and the next hover has to be free to claim it back.
-    cancelOffPagePan();
+    // The off-page pan cursor is dropped along with the pan itself, since
+    // updateHighlighterCursor() below replaces it with the new tool's and the
+    // next hover has to be free to claim it back.
     m_offPageHoverCursor = false;
     
     // Phase A: Clear text selection when switching away from Highlighter
@@ -1182,13 +1168,9 @@ void DocumentViewport::setEraserMode(EraserMode mode)
         return;
     }
 
-    // Cancel any in-progress eraser lasso when switching away from Lasso mode
-    if (m_isDrawingEraserLasso) {
-        m_isDrawingEraserLasso = false;
-        m_eraserLassoPageIndex = -1;
-        m_lassoPath.clear();
-        m_pointerActive = false;
-    }
+    // The mode change can arrive mid-press, so the lasso or the erase drag
+    // started under the old mode ends before the new one takes effect.
+    cancelPointerGesture();
 
     m_eraserMode = mode;
     emit eraserModeChanged(mode);
@@ -4371,6 +4353,11 @@ void DocumentViewport::hideEvent(QHideEvent* event)
         m_gestureTimeoutTimer->stop();
     }
     
+    // A press interrupted by a tab switch or by the app going to the
+    // background never gets its release either, so the gesture it started ends
+    // here instead of waking up under whatever is drawn next.
+    cancelPointerGesture();
+
     m_offPagePanArmed = false;
     m_offPagePanDragging = false;
     m_isPanToolDragging = false;
@@ -4498,6 +4485,24 @@ void DocumentViewport::tabletEvent(QTabletEvent* event)
         && m_offPagePanArmed && !m_offPagePanDragging) {
         cancelOffPagePan();
     }
+
+#if defined(Q_OS_ANDROID) || defined(Q_OS_IOS)
+    // A pen that is demonstrably off the glass - no button down and no
+    // pressure - while a stylus gesture is still marked active means the
+    // release was dropped. Android does that when it cancels the pen's
+    // pointer because a finger joined mid-stroke. The gesture has to end on
+    // this hover rather than on the next press, because until it does every
+    // hover counts as a drag and the preview trails the pen through the air.
+    //
+    // Both conditions are required, and the check is confined to the mobile
+    // platforms that drop the release: a false positive aborts a real stroke,
+    // and a desktop tablet's release always arrives.
+    if (event->type() == QEvent::TabletMove && m_pointerActive
+        && m_activeSource == PointerEvent::Stylus
+        && event->buttons() == Qt::NoButton && event->pressure() <= 0.0) {
+        cancelPointerGesture();
+    }
+#endif
 
     // Stylus events over any of the viewport's child widgets arrive here by
     // propagation. Leave them unhandled so a mouse event is synthesized for
@@ -5990,7 +5995,18 @@ void DocumentViewport::handlePointerPress(const PointerEvent& pe)
     if (!hasFocus()) {
         setFocus(Qt::OtherFocusReason);
     }
-    
+
+    // Arriving with a pointer still "active" means the previous gesture never
+    // got its release - Android drops the pen's release when it cancels the
+    // pointer for a finger that joined. Left alone, the stale flags decide how
+    // this press is interpreted: the release below would commit a straight
+    // line for a press that started one minutes ago, under whichever tool is
+    // now selected. The guards in mousePressEvent()/tabletEvent() mean a
+    // genuinely live gesture from another device never reaches this point.
+    if (m_pointerActive) {
+        cancelPointerGesture();
+    }
+
     // Set active state
     m_pointerActive = true;
     m_activeSource = pe.source;
@@ -15427,6 +15443,64 @@ void DocumentViewport::cancelOffPagePan()
     m_pointerActive = false;
     m_activeSource = PointerEvent::Unknown;
     updateHighlighterCursor();
+}
+
+bool DocumentViewport::cancelPointerGesture()
+{
+    const bool gestureInFlight =
+        m_pointerActive || m_isDrawing || m_isDrawingStraightLine
+        || m_isDrawingLasso || m_isDrawingEraserLasso || m_isTransformingSelection
+        || m_isCreatingTextBox || m_isDraggingObjects || m_isResizingObject
+        || m_isPanToolDragging || m_offPagePanArmed;
+    if (!gestureInFlight) {
+        return false;
+    }
+
+    // Object gestures own the whole pointer state, including the undo of a
+    // half-finished drag, so they cancel themselves.
+    if (hasActiveObjectPointerGesture()) {
+        cancelObjectPointerGesture();
+    }
+
+    cancelOffPagePan();
+
+    if (m_isPanToolDragging) {
+        endPanGesture();
+        m_isPanToolDragging = false;
+    }
+
+    // Committed, not discarded: these points are ink the user already saw
+    // appear under the pen.
+    if (m_isDrawing) {
+        finishStroke();
+    }
+
+    // The end point of a preview gesture only exists on release, so an
+    // interrupted one has nothing to commit.
+    m_isDrawingStraightLine = false;
+    m_straightLinePageIndex = -1;
+
+    if (m_isDrawingLasso || m_isDrawingEraserLasso) {
+        m_isDrawingLasso = false;
+        m_isDrawingEraserLasso = false;
+        m_eraserLassoPageIndex = -1;
+        m_lassoPath.clear();
+        resetLassoPathCache();
+    }
+
+    if (m_isTransformingSelection) {
+        finalizeSelectionTransform();
+    }
+
+    m_textSelection.isSelecting = false;
+
+    m_pointerActive = false;
+    m_activeSource = PointerEvent::Unknown;
+    m_activeDrawingPage = -1;
+    m_hardwareEraserActive = false;
+
+    update();
+    return true;
 }
 
 void DocumentViewport::handleOffPagePanTap()

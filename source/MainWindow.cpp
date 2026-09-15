@@ -111,6 +111,7 @@
 // ============================================================================
 
 #include "android/PdfPickerAndroid.h"
+#include "android/StylusButtonAndroid.h"  // BUG-A010: pen barrel button
 
 #elif defined(Q_OS_IOS)
 #include "ui/dialogs/SaveDocumentDialog.h"
@@ -234,6 +235,14 @@ MainWindow::MainWindow(QWidget *parent)
             }
         }
     });
+#endif
+
+#ifdef Q_OS_ANDROID
+    // BUG-A010: a click of the pen's side button toggles the eraser. Connecting
+    // here is also what publishes the bridge to its JNI callback, so clicks
+    // before the window exists are dropped rather than queued.
+    connect(StylusButtonAndroid::instance(), &StylusButtonAndroid::clicked,
+            this, &MainWindow::toggleStylusEraser);
 #endif
 
     // Enable IME support for multi-language input
@@ -5037,6 +5046,31 @@ void MainWindow::goToNextPage() {
     if (!vp) return;
     switchPage(vp->currentPageIndex() + 1);
 }
+
+#ifdef Q_OS_ANDROID
+void MainWindow::toggleStylusEraser() {
+    // BUG-A010: pens with a side button but no eraser nib (Wacom AES, e.g. the
+    // Lenovo Precision Pen 2) reach the eraser through this toggle. The tool the
+    // pen came from is restored on the second click, so a marker or highlighter
+    // user gets their tool back rather than the pen.
+    DocumentViewport* vp = currentViewport();
+    if (!vp) return;
+
+    // Swapping tools mid-stroke would leave the stroke half-drawn under the
+    // pen, so a click during a stroke is ignored.
+    if (vp->isPointerActive()) return;
+
+    if (m_panHoldActive) m_panHoldActive = false;
+    if (m_toolOverrideViewport == vp) m_toolOverrideViewport = nullptr;
+
+    if (vp->currentTool() == ToolType::Eraser) {
+        vp->setCurrentTool(m_toolBeforeStylusEraser);
+    } else {
+        m_toolBeforeStylusEraser = vp->currentTool();
+        vp->setCurrentTool(ToolType::Eraser);
+    }
+}
+#endif
 
 
 bool MainWindow::eventFilter(QObject *obj, QEvent *event) {

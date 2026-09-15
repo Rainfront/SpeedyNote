@@ -25,6 +25,7 @@ echo ""
 # - Mount project directory (-v)
 # - Mount .gradle cache for faster builds (-v)
 docker run -it --rm \
+    --platform=linux/amd64 \
     -v "${PROJECT_ROOT}:/workspace" \
     -v "${HOME}/.gradle:/root/.gradle" \
     -w /workspace \

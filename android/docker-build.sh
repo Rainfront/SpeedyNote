@@ -14,8 +14,10 @@ echo ""
 
 cd "${SCRIPT_DIR}"
 
-# Build the Docker image
+# Always amd64: Qt host tools and the NDK prebuilts are x86_64. On Apple
+# Silicon this runs under QEMU/Rosetta (slower image build, correct toolchain).
 docker build \
+    --platform=linux/amd64 \
     --tag "${IMAGE_NAME}:${IMAGE_TAG}" \
     --file Dockerfile \
     .

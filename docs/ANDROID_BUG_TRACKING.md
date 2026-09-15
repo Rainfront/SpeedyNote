@@ -26,6 +26,8 @@
 | **BUG-A007** | Dark Mode Not Syncing | ✅ Fixed (JNI + Fusion style) |
 | **BUG-A008** | Stylus Eraser Not Working | ✅ Fixed (JNI tool type detection) |
 | **BUG-A009** | CJK Font Rendering Incorrect | ✅ Fixed (locale-aware font fallback) |
+| **BUG-A010** | Stylus Side Button Does Nothing | ✅ Fixed (JNI button click → eraser toggle) |
+| **BUG-A011** | Interrupted Press Leaves a Phantom Drawing Mode | ✅ Fixed (central gesture cancellation) |
 
 **All critical bugs resolved!** 🎉
 
@@ -933,6 +935,141 @@ static void applyAndroidFonts(QApplication& app)
 - ✅ Simplified Chinese devices show SC glyphs
 - ✅ Traditional Chinese devices show TC glyphs
 - ✅ Japanese devices show JP glyphs
+
+---
+
+### BUG-A010: Stylus Side Button Does Nothing
+**Status:** ✅ Fixed  
+**Priority:** Medium  
+**Category:** Input / Stylus
+**Platform:** Android only
+
+**Description:**  
+Clicking the side button of a Wacom AES pen (Lenovo Precision Pen 2) or an S Pen has no effect. It should switch between the pen and the eraser.
+
+**Root Cause:**  
+Two gaps stacked on top of each other:
+
+1. The Android layer only looked at the tool *type* (the BUG-A008 eraser-nib fix). AES pens like the Precision Pen 2 have a side button and no eraser nib, so `TOOL_TYPE_ERASER` never arrives and the button state was never read at all. A click made while hovering is worse still: hover and `ACTION_BUTTON_PRESS` events go to `dispatchGenericMotionEvent()`, which the activity did not override, so they were never seen.
+2. Even where Qt did map the button onto `QTabletEvent::buttons()`, nothing acted on it. `PointerEvent::stylusButtons` was populated and never read, and the settings UI that once mapped side buttons to tools is commented out in `ControlPanelDialog.cpp` with no `MainWindow` API behind it.
+
+**Follow-up (Lenovo Bluetooth pens):** On Lenovo Idea Tab / Pen Plus style devices the barrel button is **not** a digitizer HID button. Lenovo's `BluetoothPenInputPolicy` delivers vendor `KeyEvent`s with codes **600–604** to the foreground activity (600=single, 601=double, 602=triple, 603=long, 604=long+click). Detect on `ACTION_UP` only. Double-press (601) is what Android 16's "switch pen/eraser" gesture uses.
+
+**Symptoms (BEFORE fix):**
+- Side button click does nothing, in contact or hovering
+- Eraser reachable only from the toolbar or the keyboard shortcut
+- Eraser nib on dual-tip pens works (BUG-A008), so only button pens are affected
+
+**Fix Applied:**
+
+**Layer 1: Java-side button detection**  
+`SpeedyNoteActivity.java` tracks the barrel button over all three transports OEMs use, feeding one shared held/released state so a pen reporting two of them only toggles once:
+
+| Transport | Where it arrives |
+|-----------|------------------|
+| Button bits on touch events | `dispatchTouchEvent()` (tip on glass) |
+| Button bits on hover / `ACTION_BUTTON_PRESS` | `dispatchGenericMotionEvent()` (tip in air) |
+| `KEYCODE_STYLUS_BUTTON_*` (API 33+) | `dispatchKeyEvent()` |
+
+Detection is restricted to stylus tool types, so a mouse's right or middle button (which shares `BUTTON_SECONDARY`/`BUTTON_TERTIARY` with some pens) never swaps the tool. The press edge is reported through a `native` method, debounced by 150 ms.
+
+**Layer 2: C++ bridge**  
+`source/android/StylusButtonAndroid.cpp` receives the JNI call on the Android UI thread and re-emits `clicked()` on the GUI thread:
+
+```cpp
+extern "C" JNIEXPORT void JNICALL
+Java_org_speedynote_app_SpeedyNoteActivity_onStylusButtonClicked(JNIEnv*, jclass)
+{
+    if (StylusButtonAndroid* bridge = s_bridge.loadAcquire()) {
+        bridge->reportClick();
+    }
+}
+```
+
+**Layer 3: Tool toggle**  
+`MainWindow::toggleStylusEraser()` swaps the active viewport between the eraser and the tool the pen was using, so a marker or highlighter user gets their tool back rather than the pen. It goes through `setCurrentTool()` like the keyboard shortcut, so the toolbar and action bar follow. Clicks during a stroke are ignored: swapping tools mid-stroke would leave the stroke half-drawn under the pen.
+
+**Files Modified:**
+- `android/app-resources/src/org/speedynote/app/SpeedyNoteActivity.java`
+  - Added barrel button state, debounce, and `onStylusButtonClicked()` native declaration
+  - Added `trackStylusButton()` call in `dispatchTouchEvent()`
+  - Added `dispatchGenericMotionEvent()` and `dispatchKeyEvent()` overrides
+
+- `source/android/StylusButtonAndroid.{h,cpp}` (new)
+  - GUI-thread bridge plus the JNI callback
+
+- `source/MainWindow.{h,cpp}`
+  - Connected the bridge and added `toggleStylusEraser()`
+
+- `source/core/DocumentViewport.h`
+  - Added `isPointerActive()` so the toggle can wait out a stroke
+
+- `CMakeLists.txt`
+  - Added the new source to `ANDROID_PLATFORM_SOURCES`
+
+**Desktop Impact:** None - the bridge is Android-only and the `MainWindow` changes are wrapped in `#ifdef Q_OS_ANDROID`.
+
+**Result:**
+- ✅ Side button click switches to the eraser, click again returns to the previous tool
+- ✅ Works whether the pen is touching the screen or hovering
+- ✅ Covers button-bit pens and OEM stacks that send stylus key codes
+- ✅ A click mid-stroke no longer risks breaking the stroke
+
+---
+
+### BUG-A011: Interrupted Press Leaves a Phantom Drawing Mode
+**Status:** ✅ Fixed  
+**Priority:** High  
+**Category:** Input / Core
+**Platform:** All (surfaces on Android)
+
+**Description:**  
+After switching tools, the canvas falls into a mode where a line trails the hovering pen without ever being drawn, tapping somewhere else commits a straight line even though straight-line mode is off, and undo does not clear what is on screen - the line survives the first undo and leaves marks behind after it does go. Reported while switching tools and undoing with a finger.
+
+**Root Cause:**  
+`handlePointerMove()` only asks whether *a* pointer is active; which gesture is running is held in flags (`m_pointerActive`, `m_isDrawing`, `m_isDrawingStraightLine`, `m_isDrawingLasso`, `m_isDrawingEraserLasso`) that were only ever cleared by the release matching the press. Nothing cleared them when the release never arrived, and there are two ways it does not:
+
+1. **A tool switch mid-press.** `setCurrentTool()` cancelled an in-progress eraser lasso and Pan drag and nothing else, so a stroke, a straight-line preview, or a lasso begun under the outgoing tool stayed "in flight" under the incoming one. `m_straightLineMode` was switched off directly rather than through `setStraightLineMode()`, which is the path that cancels a preview, so `m_isDrawingStraightLine` in particular outlived every switch. On Android the switch lands mid-press easily: the toolbar takes a finger tap while the pen is still down, and the BUG-A010 side button adds a second trigger.
+2. **A dropped release.** Android cancels the pen's pointer when a finger joins the gesture, and the `TabletRelease` Qt would have delivered never comes.
+
+With the flags stuck, hover becomes drag. `m_isDrawingStraightLine` is checked before the tool in both the move and the release handler, so the preview follows the pen in the air under any tool and the next release runs `createStraightLineStroke()` from the original press point. The stroke case explains the undo symptoms: an in-flight stroke is not on the undo stack yet, so undo removes the one before it, and the still-live incremental stroke cache keeps painting the leftover.
+
+**Symptoms (BEFORE fix):**
+- A line follows the pen after a tool switch and never commits
+- Tapping elsewhere draws a straight line with straight-line mode off
+- Undo removes the wrong stroke, then leaves residue behind
+- Worse when a finger is involved, because that is what makes Android cancel the pen
+
+**Fix Applied:**
+
+`DocumentViewport::cancelPointerGesture()` ends whatever gesture is in flight in one place. A stroke is **committed** - those points are ink the user already watched appear - while preview-only gestures (straight line, lasso, eraser lasso) are **discarded**, because their end point only exists on release. Object drags delegate to the existing `cancelObjectPointerGesture()`, which also undoes a half-finished move.
+
+It runs at every point a release can go missing:
+
+| Call site | Interruption it covers |
+|-----------|------------------------|
+| `setCurrentTool()` | Toolbar tap or side button mid-press |
+| `setEraserMode()` | Mode change mid-lasso |
+| `handlePointerPress()` | Backstop: a press arriving with a gesture still active |
+| `tabletEvent()` (`TabletMove`) | Pen hovering off the glass with a gesture still active |
+| `hideEvent()` | Tab switch or the app going to the background |
+
+The `tabletEvent()` case requires both `buttons() == Qt::NoButton` **and** `pressure() <= 0.0`, and is compiled only for Android and iOS. Either signal alone is unreliable across pen stacks and a false positive would abort a real stroke, while a desktop tablet's release always arrives. Together they end the phantom mode as soon as the pen lifts, rather than on the next press.
+
+**Files Modified:**
+- `source/core/DocumentViewport.{h,cpp}`
+  - Added `cancelPointerGesture()` and called it from the five sites above
+  - Removed the ad-hoc eraser-lasso and Pan cleanups in `setCurrentTool()`/`setEraserMode()` that it subsumes
+- `source/core/DocumentViewportTests.h`
+  - Added `testInterruptedPointerGesture`
+
+**Desktop Impact:** The same leak exists on desktop wherever a tool switch lands mid-press (keyboard shortcut, action bar), so the fix applies there too.
+
+**Result:**
+- ✅ A tool switch mid-press ends that press's gesture instead of handing it to the new tool
+- ✅ No straight line is committed from a press that was interrupted
+- ✅ The phantom mode clears when the pen lifts, and cannot survive into the next press
+- ✅ Undo stays in step with the canvas
 
 ---
 

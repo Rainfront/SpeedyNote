@@ -848,6 +848,13 @@ private:
     ToolType m_toolBeforePanHold = ToolType::Pen;
     int m_panHoldKey = 0;
     
+#ifdef Q_OS_ANDROID
+    // Stylus barrel button (BUG-A010): click swaps between the eraser and
+    // whichever tool the pen was using before.
+    void toggleStylusEraser();
+    ToolType m_toolBeforeStylusEraser = ToolType::Pen;
+#endif
+    
     // Event filter for scrollbar hover detection
     bool eventFilter(QObject *obj, QEvent *event) override;
     

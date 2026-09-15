@@ -69,6 +69,8 @@ misc/
 android/test-app/
 android/mupdf-build/
 android/build-app/
+android/build-apk.log
+android/build-apk.status
 SpeedyNote-Android-android-conan/
 private_scripts/
 plans.txt

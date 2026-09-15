@@ -651,6 +651,105 @@ public:
     }
 
     /**
+     * @brief Test that a press whose release goes missing does not outlive it.
+     *
+     * handlePointerMove() only asks whether a pointer is active, so a gesture
+     * left in flight turns every later hover into a drag: the straight-line
+     * preview trails the pen through the air and the next release commits a
+     * line the user never drew, under a tool that does not draw lines.
+     */
+    static bool testInterruptedPointerGesture() {
+        printf("  testInterruptedPointerGesture... ");
+        auto fail = [](const char* message) {
+            printf("FAILED: %s\n", message);
+            return false;
+        };
+
+        auto doc = Document::createNew("Interrupted gesture");
+        DocumentViewport viewport;
+        viewport.resize(1200, 800);
+        viewport.setAttribute(Qt::WA_DontShowOnScreen, true);
+        viewport.show();
+        QApplication::processEvents();
+        viewport.setDocument(doc.get());
+        viewport.setZoomLevel(1.0);
+        viewport.setPanOffset(QPointF(0, 0));
+
+        auto makeEvent = [&](PointerEvent::Type type, QPointF pos) {
+            PointerEvent pe;
+            pe.type = type;
+            pe.source = PointerEvent::Stylus;
+            pe.viewportPos = pos;
+            pe.button = Qt::LeftButton;
+            pe.pressure = 1.0;
+            pe.pageHit = viewport.viewportToPage(pos);
+            return pe;
+        };
+
+        Page* page = doc->page(0);
+        if (!page || !page->activeLayer())
+            return fail("test page has no active layer");
+
+        const QRectF page0 = viewport.pageRect(0);
+        const QPointF start = viewport.documentToViewport(page0.center());
+        const QPointF elsewhere = start + QPointF(140.0, 70.0);
+
+        // ----- Switching tools mid-press ends that press's gesture -----
+        viewport.setCurrentTool(ToolType::Pen);
+        viewport.setStraightLineMode(true);
+        viewport.handlePointerEvent(makeEvent(PointerEvent::Press, start));
+        if (!viewport.m_isDrawingStraightLine)
+            return fail("straight line press did not start a preview");
+
+        viewport.setCurrentTool(ToolType::Eraser);
+        if (viewport.m_isDrawingStraightLine)
+            return fail("tool switch left the straight line preview armed");
+        if (viewport.m_pointerActive)
+            return fail("tool switch left the pointer active");
+
+        const int strokesAfterSwitch = page->activeLayer()->strokes().size();
+        viewport.handlePointerEvent(makeEvent(PointerEvent::Move, elsewhere));
+        viewport.handlePointerEvent(makeEvent(PointerEvent::Release, elsewhere));
+        if (page->activeLayer()->strokes().size() != strokesAfterSwitch)
+            return fail("a move after the switch still committed a line");
+
+        // ----- The next press stands in for a release that never came -----
+        viewport.setCurrentTool(ToolType::Pen);
+        viewport.setStraightLineMode(true);
+        viewport.handlePointerEvent(makeEvent(PointerEvent::Press, start));
+        if (!viewport.m_isDrawingStraightLine)
+            return fail("second straight line press did not start a preview");
+
+        viewport.handlePointerEvent(makeEvent(PointerEvent::Press, elsewhere));
+        const QPointF restartedFrom = viewport.viewportToPage(elsewhere).pagePoint;
+        if (viewport.m_straightLineStart != restartedFrom)
+            return fail("a stale start point survived into the next press");
+        viewport.handlePointerEvent(makeEvent(PointerEvent::Release, elsewhere));
+        viewport.setStraightLineMode(false);
+
+        // ----- An eraser mode change mid-press drops the lasso it owns -----
+        viewport.setCurrentTool(ToolType::Eraser);
+        viewport.setEraserMode(DocumentViewport::EraserMode::Lasso);
+        viewport.handlePointerEvent(makeEvent(PointerEvent::Press, start));
+        if (!viewport.m_isDrawingEraserLasso)
+            return fail("eraser lasso press did not start a path");
+
+        viewport.setEraserMode(DocumentViewport::EraserMode::Normal);
+        if (viewport.m_isDrawingEraserLasso)
+            return fail("eraser mode change left the lasso in flight");
+        if (!viewport.m_lassoPath.isEmpty())
+            return fail("eraser mode change left the lasso path behind");
+        if (viewport.m_pointerActive)
+            return fail("eraser mode change left the pointer active");
+
+        viewport.hide();
+        viewport.setDocument(nullptr);
+
+        printf("PASSED\n");
+        return true;
+    }
+
+    /**
      * @brief Test left/current and right/alternate ObjectSelect mode resolution.
      */
     static bool testObjectAlternateMouseMode() {
@@ -5618,6 +5717,7 @@ public:
         runTest(testPdfCache, "testPdfCache");
         runTest(testPointerEvents, "testPointerEvents");
         runTest(testOffPagePanFromEmptySpace, "testOffPagePanFromEmptySpace");
+        runTest(testInterruptedPointerGesture, "testInterruptedPointerGesture");
         runTest(testObjectAlternateMouseMode, "testObjectAlternateMouseMode");
         runTest(testObjectGestureCancellation, "testObjectGestureCancellation");
         runTest(testObjectPageContainment, "testObjectPageContainment");
